@@ -1,8 +1,8 @@
 tidetank
 ========
 
-Arduino code for Tide Tank, a fish tank with a water level proportional to the local tide
-
+An Arduino-based system to coordinate a fish tank's water level with the actual local tide.
+ 
 This sketch runs on an Arduino Uno with an Ethernet shield as well as an Adafruit RGB LCDshield on top.
  A potentiometer is connected to A0 and mounted on the side of the tank; a float on a long stick 
  turns the potentiometer towards clockwise when the water's higher and towards counterclockwise 
