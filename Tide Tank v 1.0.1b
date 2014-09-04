@@ -1,0 +1,383 @@
+/* 
+ Rocking the Boat's Tide Tank system
+ 
+ An Arduino-based system to coordinate a fish tank's water level with the actual local tide.
+ 
+ This sketch runs on an Arduino Uno with an Ethernet shield as well as an Adafruit RGB LCDshield on top.
+ A potentiometer is connected to A0 and mounted on the side of the tank; a float on a long stick 
+ turns the potentiometer towards clockwise when the water's higher and towards counterclockwise 
+ when it's lower.
+ A servomotor (operating a drain valve) is connected to pin 8.
+ 
+ Our fishtank is constantly being filled from a sump into which it drains. Changing the rate
+ of drainage out of the tank will dynamically change how full it is at any given moment. The
+ present system achieves desired water tank height by adjusting the drain flow rate.
+ 
+ The basic program flow is:
+ 
+ 1) load saved calibration points from EEPROM, start systems up
+ 2) go online and request current water height data from NOAA
+ 3) determine how high the water in the tank should be, as a percent
+ 4) increment or decrement the drain valve by small amounts until the water is at the correct hight.
+ 
+ Step 2 repeats every 6 minutes (NOAA updates their data at that interval).
+ If Step 2 fails, it repeats every 10 seconds, trying to get back online.
+ Steps 3 and 4 repeat every 5 seconds.
+ 
+ There are also buttons implemented for various purposes:
+ * Left opens the drain and halts the program.
+ * Right closes the drain and halts the program.
+ * Up sets the current float sensor position as 100% (and saves to EEPROM)
+ * Down sets the current float sensor position as 0% (and saves to EEPROM)
+ * Select immediately requests a web update, instead of waiting the usual 6 minutes.
+ 
+ Written by Robert Zacharias for/at Rocking the Boat, http://www.rockingtheboat.org , an awesome
+ nonprofit organization in the South Bronx, New York City. Feel free to contact the author with 
+ questions/comments/etc. at bobby.zacharias@gmail.com.
+ 
+ v. 1.0 completed on 8/27/14
+ 
+ edits:
+ v. 1.0.1b, 8/29/14 revision: 
+   changed servo default to closed
+   changed so valve closes always in big bites (our tank drains much faster than it fills)
+   write valve closed at top of setup() so valve always closes first
+   fixed valveOpen and valveClosed as per experimental outcomes
+   restated adjustValvePosition() in terms of valveOpen and valveClosed rather than absolute values like 0 and 180. 
+ 
+ v. 1.1, to be done:
+  fix water height readings--need to be made from an arc path into a linearized height reading
+  (probably write a function for this as it's a few steps in a chain)
+  (also this might require a more complex zeroing process, probably putting the valve arm straight up,
+   straight horizontal, and then finally calibrating to high and low water levels, so the trig can
+    know what angles are represented by each position and do the height math appropriately) 
+ 
+ incorporates material from Michael Margolis's "Requesting Data from a Web Server Using XML" https://www.inkling.com/read/arduino-cookbook-michael-margolis-2nd/chapter-15/recipe-15-5
+ 
+*/
+
+#include <SPI.h>
+#include <Ethernet.h>
+#include <Wire.h>
+#include <Adafruit_MCP23017.h>
+#include <Adafruit_RGBLCDShield.h>
+#include <Servo.h>
+#include <EEPROM.h>
+
+Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
+Servo valveServo;
+
+int tankRawPin = A0;    // tank water sensor pot
+int tankRaw; // percent of tank filled
+int tankGoal; // percent of tank that should be filled, based on web data
+int calibrateHigh = 1023; // to hold current float position as high water point
+int calibrateLow = 0; // to hold current float position as low water point
+int tankPercent; // percent the tank is full, according to most recent sensor
+int tankPercentSum; // sum of the last 5 tankPercent readings
+int tankAveragePercent; // average of last 5 readings
+float waterheight = 11; // float of the height measurement returned by NOAA, defaults to super low tide
+int lastConnectionState = 0; // stores whether or the NOAA connection worked at the last attempt
+int valveOpen = 80; // servo value for valve fully opened
+int valveClosed = 180; // servo value for valve fully closed
+int valvePos = 180; // servo value for current valve position, open by default
+unsigned long mostRecentTimeUpdated; // timer to set to millis() when most recently updated
+int p = 0; // incrementer for averaging last 5 readings
+
+void(* resetFunc) (void) = 0; // declare reset function at address 0
+
+unsigned long oneSecDelay = 0;
+unsigned long HourDelay = 1000 * 60 * 60;
+
+byte mac[] = { 0x90, 0xA2, 0xDA, 0x0F, 0x9C, 0xEB }; // Ethernet shield's unique MAC
+IPAddress NOAAip(140,90,78,215); //IP for tidesandcurrents.noaa.gov
+
+EthernetClient client;
+
+byte RED = 0x1;
+byte YELLOW = 0x3;
+byte GREEN = 0x2;
+byte TEAL = 0x6;
+byte BLUE = 0x4;
+byte VIOLET = 0x5;
+byte WHITE = 0x7;
+byte rainbow[] = {RED, YELLOW, GREEN, TEAL, BLUE, VIOLET};
+
+void setup()
+{
+  
+  Serial.begin(9600);
+  
+  
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Rocking the Boat");
+  lcd.setCursor(0,1);
+  lcd.print("Tide tank v1.0.1");
+
+  for(int a = 0; a < 6; a++){
+    lcd.setBacklight(rainbow[a]);
+    delay(200);
+  }
+
+  lcd.setBacklight(WHITE);
+  lcd.setCursor(0,0);
+  lcd.clear();
+
+  calibrateLow = readFromEeprom(0);
+  calibrateHigh = readFromEeprom(1);
+  lcd.print("cal'n loaded");
+  delay(1000);
+
+  lcd.clear();
+  lcd.print("starting ethernet");
+  if(Ethernet.begin(mac) == 0) { // start ethernet using mac & IP address
+    lcd.setBacklight(RED);
+    lcd.print("error: offline");
+  }
+
+  lcd.print("connecting...");
+  delay(1000); // give the Ethernet shield a second to initialize
+
+  valveServo.attach(8); // set up servo control on 8
+}
+
+void loop(){
+  
+  unsigned long mostRecentTimeFailedUpdate; // timer to set to millis() when update fails
+  int countdownUntilUpdateAfterFail;
+  int countdownUntilUpdateAfterConnect;
+  unsigned long millisecondDelayUntilNextUpdate;
+  
+  buttonFunctions();
+
+  if(lastConnectionState == 1) millisecondDelayUntilNextUpdate = 360000UL; // 6 minutes
+  else if(lastConnectionState == 0) millisecondDelayUntilNextUpdate = 10000UL; // 10 seconds
+
+  if(millis() >=  (mostRecentTimeUpdated + millisecondDelayUntilNextUpdate) ){
+    fetchAndPrintNOAAdata();
+    mostRecentTimeUpdated = millis(); // then reset the timer
+  }
+
+  if(lastConnectionState == 0){
+    countdownUntilUpdateAfterFail = ( (mostRecentTimeUpdated + millisecondDelayUntilNextUpdate - millis() ) / 1000) + 1;
+    lcd.setCursor(15,0); // use upperrightmost digit (it's a seconds countdown from 10)
+    lcd.print(countdownUntilUpdateAfterFail);
+  }
+
+  else if(lastConnectionState == 1){
+    countdownUntilUpdateAfterConnect = ( (mostRecentTimeUpdated + millisecondDelayUntilNextUpdate - millis() ) / 1000 / 60) + 1; // single digit, in minutes
+    lcd.setCursor(15,0); // use upperrightmost digit (it's a minutes countdown from 6)
+    lcd.print(countdownUntilUpdateAfterConnect);
+  }
+
+  //math to turn pot value into percentage representing how full the tank is
+  tankRaw = analogRead(tankRawPin);
+  tankPercent = map(tankRaw, calibrateLow, calibrateHigh, 0, 100);
+  lcd.setCursor(0,1);
+  lcd.print("t:"); 
+  lcd.print(tankAveragePercent);
+
+  //math to calculate tank height as derived from actual tide height
+  tankGoal = map(waterheight, -1, 10, 0, 100); // local tide runs approx. from -1 to 10 feet MLLW over the course of the year
+  lcd.print("/");
+  lcd.print(tankGoal);
+  lcd.print("%");
+
+  //measure height every 200 milliseconds, average over 1 second, save average value to tankAveragePercent and adjust valve
+  if ( (millis() - oneSecDelay) >= 200){ // once per 200 milliseconds
+    if(p < 5){
+      tankPercentSum += tankPercent;
+      p++; // increment counter
+      oneSecDelay = millis(); // reset timer
+    }
+    else if(p >= 5){
+      tankAveragePercent = tankPercentSum / 5;
+      p = 0; // reset counter
+      tankPercentSum = 0; // reset sum for average
+      oneSecDelay = millis(); // reset 1s timer
+      adjustValvePosition(tankAveragePercent);
+    }
+  }
+
+  if( millis() >= HourDelay ) {
+    resetFunc(); // soft reset every hour to clear memory and reload all values
+  }
+  
+}
+
+ void adjustValvePosition(int avg){
+   
+  int valvePercent; // percent position value of valve for display
+   
+  if(avg < tankGoal){ //if the water is too low
+      if(abs(avg - tankGoal) < 5) valvePos += 10; // close to goal: move the valve 10 ticks towards closing
+      if(abs(avg - tankGoal) >= 5) valvePos = valveClosed; // far from goal: close valve
+      valvePos = constrain(valvePos, valveOpen, valveClosed); // keep valvePos between 90 and 180 always
+      valveServo.write(valvePos);
+      valvePercent = map(valvePos, valveClosed, valveOpen, 0, 100);
+      lcd.print(" v:"); lcd.print(valvePercent); lcd.print("% ");
+      Serial.println("too low");
+    }
+  
+    if(avg > tankGoal){ //if the water is too high
+      if(abs(avg - tankGoal) < 5) valvePos -= 10; // close to goal: move the valve 10 ticks towards opening
+      if(abs(avg - tankGoal) >= 5) valvePos -= 20; // far from goal: move the valve 20 ticks towards opening
+      valvePos = constrain(valvePos, 80, 180); // keep valvePos between 90 and 180 always
+      valveServo.write(valvePos);
+      valvePercent = map(valvePos, valveClosed, valveOpen, 0, 100);
+      lcd.print(" v:"); lcd.print(valvePercent); lcd.print("% ");
+      Serial.println("too high");
+    }
+    
+    if(avg == tankGoal){
+      valvePos = constrain(valvePos, 80, 180); // keep valvePos between 90 and 180 always
+      valveServo.write(valvePos);
+      valvePercent = map(valvePos, valveClosed, valveOpen, 0, 100);
+      lcd.print(" v:"); lcd.print(valvePercent); lcd.print("% ");
+      Serial.println("just right");
+    }
+      
+    Serial.print("valvepos= ");Serial.println(valvePos);
+    Serial.print("valvepercent= ");Serial.println(valvePercent); Serial.print("\n\n");
+ }
+ 
+ void buttonFunctions(){
+  
+ lcd.setCursor(0,0);
+  
+ if (lcd.readButtons() & BUTTON_DOWN){
+    calibrateLow = analogRead(tankRawPin);
+    writeToEeprom (0, calibrateLow);
+    lcd.setBacklight(VIOLET);
+    lcd.clear();
+    lcd.print("min cal saved");
+    delay(1000);
+    lcd.clear();
+    fetchAndPrintNOAAdata();
+  }
+
+  if (lcd.readButtons() & BUTTON_UP) {
+    lcd.setBacklight(VIOLET);
+    lcd.clear();
+    calibrateHigh = analogRead(tankRawPin);
+    writeToEeprom (1, calibrateHigh);
+    lcd.print("max cal saved");
+    delay(1000);
+    lcd.clear();
+    fetchAndPrintNOAAdata();
+  }
+ 
+ if (lcd.readButtons() & BUTTON_LEFT) { // LEFT button opens valve and halts program
+    lcd.setBacklight(YELLOW);
+    lcd.clear();
+    lcd.print("gate held open");
+    lcd.setCursor(0,1);
+    lcd.print("reset to change");
+    valveServo.write(valveOpen);
+    while(true);
+  }
+
+  if (lcd.readButtons() & BUTTON_RIGHT) { // RIGHT button closes valve and halts program
+    lcd.setBacklight(YELLOW);
+    lcd.clear();
+    lcd.print("gate held closed");
+    lcd.setCursor(0,1);
+    lcd.print("reset to change");   
+    valveServo.write(valveClosed);
+    while(true);
+  }
+
+  if (lcd.readButtons() & BUTTON_SELECT) { // SELECT button forces immediate web query
+    if (client.connect(NOAAip,80) == 1) {
+      client.println("GET /api/datagetter?date=latest&station=8516945&product=one_minute_water_level&datum=mllw&units=english&time_zone=gmt&application=Rocking_the_Boat&format=xml HTTP/1.0");
+      client.println();
+      lastConnectionState = 1;
+      mostRecentTimeUpdated = millis();
+    }
+    else {
+      lcd.setBacklight(RED);
+      lcd.println("NOAA connect fail");
+      lastConnectionState = 0;
+      mostRecentTimeUpdated = millis();
+    }
+  }
+  
+}
+
+void fetchAndPrintNOAAdata(){ 
+ 
+ if (client.connect(NOAAip,80)>0) {
+      client.println("GET /api/datagetter?date=latest&station=8516945&product=one_minute_water_level&datum=mllw&units=english&time_zone=gmt&application=Rocking_the_Boat&format=xml HTTP/1.0");
+      client.println();
+    }
+  
+    else {
+      lcd.setBacklight(RED);
+      lcd.println("NOAA connect fail");
+      lastConnectionState = 0;
+    }
+    
+    if (client.connected()) {
+       if(client.find("v=") ) //the height data is tagged with v
+       {
+          waterheight = client.parseFloat(); //data returns as 0.00 feet, possibly negative as well?
+          lcd.clear();
+          lcd.setBacklight(GREEN);
+          lcd.print("KngsPt= ");
+          lcd.print(waterheight);
+          lcd.print("'");         
+          lastConnectionState = 1; 
+       }
+    }
+  
+    else {
+      lcd.setBacklight(RED);
+      lcd.clear();
+      lcd.print("no NOAA data");
+    }
+    client.stop();
+    client.flush();
+}
+
+/*
+to store value 0 - 1023 in eeprom:
+
+take value and divide by 4, quotient = a
+take value modulo 4, residue = b
+
+a*4 + b = value
+
+*/
+
+void writeToEeprom (byte b, int x){ // will take data form (0, 1003) for instance,
+                                    // which would mean it's minCalibration ("0") writing 1003 ("1003")
+  byte quo = x / 4; //quotient of value ÷ 4 (never bigger than 255 for analogRead)
+  byte res = x % 4; //residue of value mod 4 (never bigger than 3)
+  
+  if (b == 0) { //use 0 as minCalibration marker
+    EEPROM.write(0, quo); // write quotient to address 0
+    EEPROM.write(1, res); // write residue to address 1
+  }
+  
+  if (b == 1) { // use 1 as maxCalibration marker
+    EEPROM.write(10, quo); // write quotient to address 10
+    EEPROM.write(11, res); // write residue to address 11
+  }
+}
+
+int readFromEeprom (byte b){ // will read and return stored minCalibrate (0) or maxCalibrate (1) data
+  if (b == 0) { //for reading stored minCalibrate
+    byte quo = EEPROM.read(0);
+    byte res = EEPROM.read(1);
+    int EEPROMvalue = (quo * 4) + res;
+    return EEPROMvalue;
+  }
+  
+  if (b == 1) { // for reading stored maxCalibrate
+    byte quo = EEPROM.read(10);
+    byte res = EEPROM.read(11);
+    int EEPROMvalue = (quo * 4) + res;
+    return EEPROMvalue;
+  }
+}
